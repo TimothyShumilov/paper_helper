@@ -1,0 +1,27 @@
+# Telegram Bot
+python-telegram-bot==21.3
+
+# Database
+asyncpg==0.29.0
+
+# Vector DB
+qdrant-client==1.9.1
+
+# PDF Processing
+PyMuPDF==1.24.5
+
+# Embedding (GGUF via llama-cpp-python)
+llama-cpp-python==0.3.16
+huggingface-hub==0.24.6
+
+# LLM API
+groq==0.13.1
+
+# HTTP Client
+httpx==0.27.0
+
+# Config
+pydantic-settings==2.3.4
+
+# Scheduling
+APScheduler==3.10.4
