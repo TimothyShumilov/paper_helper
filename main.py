@@ -1,15 +1,19 @@
 """Entry point for the arXiv RAG Telegram bot."""
 import asyncio
 import logging
+import uuid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.ext import Application
 
 from config import settings
+from core import db
 from core.db import close_pool, expire_old_sessions, init_db
 from core.embedder import warmup
+from core.langfuse_client import log_session_to_langfuse
 from core.vector_store import delete_session_chunks, init_collection
 from bot.handlers import build_application
+from bot.keyboards import rating_keyboard
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -18,12 +22,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def cleanup_expired_sessions() -> None:
-    """Hourly job: expire stale sessions and remove their Qdrant vectors."""
+async def cleanup_expired_sessions(app: Application) -> None:
+    """Hourly job: expire stale sessions, remove Qdrant vectors, and handle Langfuse logging."""
     try:
-        expired_ids = await expire_old_sessions()
-        for session_id in expired_ids:
-            await delete_session_chunks(session_id)
+        expired_sessions = await expire_old_sessions()
+        for session in expired_sessions:
+            session_id_str = str(session["id"])
+            await delete_session_chunks(session_id_str)
+
+            if session["rating"] is not None:
+                # Rating already saved — log to Langfuse now
+                include_messages = session.get("trace_consent") is True
+                messages = None
+                if include_messages:
+                    messages = await db.get_session_messages(uuid.UUID(session_id_str))
+                await log_session_to_langfuse(session, session["rating"], messages)
+            else:
+                # No rating yet — notify user and show rating keyboard
+                title = session.get("paper_title") or session["arxiv_id"]
+                try:
+                    app.user_data.setdefault(session["user_id"], {})[
+                        "last_ended_session_id"
+                    ] = session_id_str
+                    await app.bot.send_message(
+                        chat_id=session["user_id"],
+                        text=(
+                            f"Ваша сессия по статье <b>{title}</b> истекла.\n"
+                            "Как оцените работу бота в этой сессии?"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=rating_keyboard(),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not notify user %s about expired session: %s",
+                        session["user_id"], exc,
+                    )
     except Exception as exc:
         logger.error("Session cleanup error: %s", exc)
 
@@ -57,6 +91,7 @@ def main() -> None:
         trigger="interval",
         hours=1,
         id="session_cleanup",
+        kwargs={"app": app},
     )
     scheduler.start()
     logger.info("Scheduler started (session cleanup every 1 hour).")
