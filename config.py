@@ -46,5 +46,10 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 24
     pdf_download_dir: str = "/app/data/pdfs"
 
+    # Langfuse (optional — bot works without these)
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+
 
 settings = Settings()

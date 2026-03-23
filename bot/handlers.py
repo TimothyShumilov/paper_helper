@@ -30,13 +30,14 @@ from telegram.ext import (
 from config import settings
 from core import arxiv_loader, pdf_parser, chunker, embedder, vector_store
 from core import db, rag_pipeline
+from core.langfuse_client import log_session_to_langfuse
 from bot.keyboards import (
+    CB_ALLOW_TRACE,
+    CB_DENY_TRACE,
     CB_RATE_DOWN,
     CB_RATE_UP,
-    CB_RETURN_PREFIX,
-    CB_SESSIONS_PAGE,
-    new_session_keyboard,
     rating_keyboard,
+    trace_permission_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,19 +45,25 @@ logger = logging.getLogger(__name__)
 # ConversationHandler states
 IDLE, READY, SESSION_ENDED = range(3)
 
-COMMANDS_HINT = "\n\nКоманды: /summarize · /new"
+COMMANDS_HINT = "\n\nПодсказка: /help — список доступных команд"
+
+HELP_TEXT = (
+    "<b>Доступные команды:</b>\n\n"
+    "/start — начать работу или вернуться к активной сессии\n"
+    "/summarize — краткое изложение текущей статьи\n"
+    "/new [id/ссылка] — завершить сессию (без аргумента) или открыть статью по ID или ссылке arXiv\n"
+    "/help — показать этот список"
+)
 
 WELCOME_TEXT = (
     "Привет! Я научный ассистент для работы со статьями arXiv.\n\n"
     "Что я умею:\n"
     "• Скачать и проиндексировать статью по её ID\n"
-    "• Ответить на вопросы по содержанию статьи\n"
+    "• Ответить на вопросы по содержанию статьи — просто напишите ваш вопрос в диалог\n"
     "• Создать краткое структурированное изложение (/summarize)\n\n"
-    "Отправь мне ID статьи (например: <code>2301.07041</code>) или ссылку на неё."
+    "Отправь мне ID статьи (например: <code>2301.07041</code>) или ссылку на неё.\n\n"
+    "Полный список команд — /help"
 )
-
-SESSION_PICKER_TEXT = "Выберите сессию для продолжения или отправьте ID новой статьи:"
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,22 +77,6 @@ async def _send_typing(update: Update) -> None:
     await update.effective_chat.send_action(ChatAction.TYPING)
 
 
-async def _show_session_picker(target, user_id: int, page: int = 0) -> None:
-    """Send or edit a message showing the paginated session list."""
-    sessions = await db.get_recent_sessions(user_id)
-    if sessions:
-        keyboard = new_session_keyboard(sessions, page=page)
-        if hasattr(target, "edit_message_text"):
-            await target.edit_message_text(SESSION_PICKER_TEXT, reply_markup=keyboard)
-        else:
-            await target.reply_text(SESSION_PICKER_TEXT, reply_markup=keyboard)
-    else:
-        if hasattr(target, "edit_message_text"):
-            await target.edit_message_text(WELCOME_TEXT, parse_mode="HTML")
-        else:
-            await target.reply_text(WELCOME_TEXT, parse_mode="HTML")
-
-
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -95,9 +86,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     active = await db.get_active_session(user_id)
     if active:
         context.user_data["session_id"] = str(active["id"])
+        title = active.get("paper_title") or active["arxiv_id"]
         await update.message.reply_text(
-            f"У вас есть активная сессия по статье <b>{active['arxiv_id']}</b>.\n"
-            "Можете продолжать задавать вопросы или выбрать команду."
+            f"Активна сессия по статье <b>{title}</b>.\n"
+            "Задавайте вопросы или используйте <code>/new &lt;id&gt;</code> для переключения."
             + COMMANDS_HINT,
             parse_mode="HTML",
         )
@@ -108,19 +100,60 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 # ---------------------------------------------------------------------------
-# /new — end current session (if any), ask for rating, then show session picker
+# /help
+# ---------------------------------------------------------------------------
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
+    return READY if _session_id(context) else IDLE
+
+
+# ---------------------------------------------------------------------------
+# /new [arxiv_id] — open paper or end session
 # ---------------------------------------------------------------------------
 
 async def new_session_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    args = context.args or []
+    raw = args[0] if args else None
     session_id = _session_id(context)
     user_id = update.effective_user.id
 
+    if raw:
+        arxiv_id = arxiv_loader.validate_arxiv_id(raw)
+        if arxiv_id is None:
+            await update.message.reply_text(
+                "Не могу распознать ID статьи. Примеры:\n"
+                "<code>/new 2301.07041</code>\n"
+                "<code>/new https://arxiv.org/abs/2301.07041</code>",
+                parse_mode="HTML",
+            )
+            return SESSION_ENDED if session_id else IDLE
+
+        if session_id:
+            # End current session and ask for rating; open new paper after rating
+            try:
+                await db.end_session(uuid.UUID(session_id))
+            except Exception as exc:
+                logger.warning("Could not end session %s: %s", session_id, exc)
+            context.user_data["last_ended_session_id"] = session_id
+            context.user_data["pending_arxiv_id"] = arxiv_id
+            context.user_data.pop("session_id", None)
+            await update.message.reply_text(
+                "Сессия завершена. Как оцените работу бота в этой сессии?",
+                reply_markup=rating_keyboard(),
+            )
+            return SESSION_ENDED
+
+        # No active session — open paper directly
+        return await _open_by_arxiv_id(context, user_id, arxiv_id, update.message.reply_text)
+
+    # /new without args: end session and ask for rating
     if session_id:
-        # End current session and ask for rating
         try:
             await db.end_session(uuid.UUID(session_id))
         except Exception as exc:
             logger.warning("Could not end session %s: %s", session_id, exc)
+        context.user_data["last_ended_session_id"] = session_id
         context.user_data.pop("session_id", None)
         await update.message.reply_text(
             "Сессия завершена. Как оцените работу бота в этой сессии?",
@@ -128,9 +161,49 @@ async def new_session_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return SESSION_ENDED
 
-    # No current session — show picker immediately
-    await _show_session_picker(update.message, user_id)
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="HTML")
     return IDLE
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: open paper by validated arxiv_id
+# ---------------------------------------------------------------------------
+
+async def _open_by_arxiv_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    arxiv_id: str,
+    reply_fn,
+) -> int:
+    """Resume existing session or start ingestion for the given arxiv_id.
+
+    reply_fn — async callable(text, **kwargs) -> Message (e.g. update.message.reply_text
+    or context.bot.send_message with chat_id pre-bound).
+    """
+    existing = await db.get_session_by_arxiv_id(user_id, arxiv_id)
+    if existing:
+        if existing["status"] == "ended":
+            pool = await db.get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE sessions SET status='active', ended_at=NULL WHERE id=$1",
+                    existing["id"],
+                )
+        context.user_data["session_id"] = str(existing["id"])
+        title = existing.get("paper_title") or arxiv_id
+        await reply_fn(
+            f"Найдена существующая сессия по статье <b>{title}</b>.\n"
+            "Продолжаем работу с ней." + COMMANDS_HINT,
+            parse_mode="HTML",
+        )
+        return READY
+
+    processing_msg = await reply_fn(
+        f"ID получен: <b>{arxiv_id}</b>. Начинаю загрузку и обработку статьи...\n"
+        "(это может занять несколько минут)",
+        parse_mode="HTML",
+    )
+    return await _process_paper(processing_msg, user_id, arxiv_id, context)
 
 
 # ---------------------------------------------------------------------------
@@ -150,17 +223,8 @@ async def arxiv_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return IDLE
 
-    processing_msg = await update.message.reply_text(
-        f"ID получен: <b>{arxiv_id}</b>. Начинаю загрузку и обработку статьи...\n"
-        "(это может занять несколько минут)",
-        parse_mode="HTML",
-    )
-
-    return await _process_paper(
-        processing_msg,
-        update.effective_user.id,
-        arxiv_id,
-        context,
+    return await _open_by_arxiv_id(
+        context, update.effective_user.id, arxiv_id, update.message.reply_text
     )
 
 
@@ -331,88 +395,91 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # --- Rating ---
     if data in (CB_RATE_UP, CB_RATE_DOWN):
         rating = 1 if data == CB_RATE_UP else -1
-        recent = await db.get_recent_sessions(user_id)
-        ended = [s for s in recent if s["status"] == "ended" and s["rating"] is None]
-        if ended:
+
+        # Find session to rate: prefer the one we just ended, else search recent
+        sid_str = context.user_data.pop("last_ended_session_id", None)
+        session_to_rate = None
+        if sid_str:
+            session_to_rate = await db.get_session_by_id(uuid.UUID(sid_str))
+        if session_to_rate is None:
+            recent = await db.get_recent_sessions(user_id)
+            ended = [s for s in recent if s["status"] in ("ended", "expired") and s["rating"] is None]
+            session_to_rate = ended[0] if ended else None
+
+        if session_to_rate:
             try:
-                await db.rate_session(ended[0]["id"], rating)
+                await db.rate_session(session_to_rate["id"], rating)
             except Exception as exc:
                 logger.warning("Could not save rating: %s", exc)
 
-        # Show session picker after rating
-        sessions = await db.get_recent_sessions(user_id)
-        if sessions:
+        if data == CB_RATE_UP:
+            # Rating saved to DB. If session already expired, log to Langfuse immediately.
+            if session_to_rate:
+                refreshed = await db.get_session_by_id(session_to_rate["id"])
+                if refreshed and refreshed["status"] == "expired":
+                    await log_session_to_langfuse(refreshed, rating, None)
+
+            pending_arxiv_id = context.user_data.pop("pending_arxiv_id", None)
+            if pending_arxiv_id:
+                await query.edit_message_text("Спасибо за оценку!", parse_mode="HTML")
+                chat_id = query.message.chat_id
+                reply_fn = lambda text, **kw: context.bot.send_message(
+                    chat_id=chat_id, text=text, **kw
+                )
+                return await _open_by_arxiv_id(context, user_id, pending_arxiv_id, reply_fn)
+
             await query.edit_message_text(
-                "Спасибо за оценку!\n\n" + SESSION_PICKER_TEXT,
-                reply_markup=new_session_keyboard(sessions),
-            )
-        else:
-            await query.edit_message_text(
-                "Спасибо за оценку!\n\n" + WELCOME_TEXT,
+                "Спасибо за оценку!\n\nОтправьте ID статьи или используйте "
+                "<code>/new 2301.07041</code> для открытия статьи.",
                 parse_mode="HTML",
             )
-        return SESSION_ENDED
-
-    # --- Session page navigation ---
-    if data.startswith(CB_SESSIONS_PAGE):
-        try:
-            page = int(data[len(CB_SESSIONS_PAGE):])
-        except ValueError:
             return IDLE
-        sessions = await db.get_recent_sessions(user_id)
-        await query.edit_message_reply_markup(
-            reply_markup=new_session_keyboard(sessions, page=page)
-        )
-        return IDLE
 
-    # --- Return to session ---
-    if data.startswith(CB_RETURN_PREFIX):
-        sid_str = data[len(CB_RETURN_PREFIX):]
-        try:
-            sid = uuid.UUID(sid_str)
-        except ValueError:
-            await query.edit_message_text("Неверный идентификатор сессии.")
-            return SESSION_ENDED
-
-        session = await db.get_session_by_id(sid)
-        if not session:
-            await query.edit_message_text("Сессия не найдена.")
-            return SESSION_ENDED
-
-        if session["status"] == "expired":
+        else:
+            # Negative: ask permission to save conversation history.
+            # pending_arxiv_id stays in user_data until after consent.
+            if session_to_rate:
+                context.user_data["pending_session_id"] = str(session_to_rate["id"])
+            context.user_data["pending_rating"] = rating
             await query.edit_message_text(
-                "Эта сессия истекла (>24 часов). Отправьте ID статьи, чтобы начать новую."
+                "Разрешаете сохранить историю этого диалога для улучшения качества бота?",
+                reply_markup=trace_permission_keyboard(),
             )
-            return IDLE
+            return SESSION_ENDED
 
-        # Reactivate ended session
-        if session["status"] == "ended":
-            from core.db import get_pool
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET status='active', ended_at=NULL WHERE id=$1",
-                    sid,
-                )
+    # --- Trace permission (after negative rating) ---
+    if data in (CB_ALLOW_TRACE, CB_DENY_TRACE):
+        pending_sid = context.user_data.pop("pending_session_id", None)
+        pending_rating = context.user_data.pop("pending_rating", -1)
+        pending_arxiv_id = context.user_data.pop("pending_arxiv_id", None)
 
-        context.user_data["session_id"] = str(sid)
-        messages = await db.get_session_messages(sid)
-        history_preview = ""
-        if messages:
-            last = messages[-2:] if len(messages) >= 2 else messages
-            for m in last:
-                role_label = "Вы" if m["role"] == "user" else "Бот"
-                preview = m["content"][:200] + ("..." if len(m["content"]) > 200 else "")
-                history_preview += f"\n<b>{role_label}:</b> {preview}"
+        if pending_sid:
+            consent = (data == CB_ALLOW_TRACE)
+            try:
+                await db.set_trace_consent(uuid.UUID(pending_sid), consent)
+            except Exception as exc:
+                logger.warning("Could not save trace consent: %s", exc)
+
+            # If session already expired, log to Langfuse immediately.
+            session = await db.get_session_by_id(uuid.UUID(pending_sid))
+            if session and session["status"] == "expired":
+                messages = await db.get_session_messages(session["id"]) if consent else None
+                await log_session_to_langfuse(session, pending_rating, messages)
+
+        if pending_arxiv_id:
+            await query.edit_message_text("Спасибо!", parse_mode="HTML")
+            chat_id = query.message.chat_id
+            reply_fn = lambda text, **kw: context.bot.send_message(
+                chat_id=chat_id, text=text, **kw
+            )
+            return await _open_by_arxiv_id(context, user_id, pending_arxiv_id, reply_fn)
 
         await query.edit_message_text(
-            f"Возврат к сессии по статье <b>{session['arxiv_id']}</b>.\n"
-            f"{history_preview}\n\n"
-            "Продолжайте задавать вопросы или используйте команды:"
-            + COMMANDS_HINT,
+            "Спасибо!\n\nОтправьте ID статьи или используйте "
+            "<code>/new 2301.07041</code> для открытия статьи.",
             parse_mode="HTML",
         )
-        return READY
+        return IDLE
 
     # Unknown callback
     logger.warning("Unknown callback data: %s", data)
@@ -442,7 +509,8 @@ async def _set_commands(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start",      "Начать / проверить активную сессию"),
         BotCommand("summarize",  "Суммаризировать текущую статью"),
-        BotCommand("new",        "Завершить сессию и выбрать следующую"),
+        BotCommand("new",        "Открыть статью: /new <ID или ссылку>"),
+        BotCommand("help",       "Показать список команд"),
     ])
 
 
@@ -457,28 +525,35 @@ def build_application() -> Application:
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_handler),
+            CommandHandler("new", new_session_handler),
+            CommandHandler("help", help_handler),
             MessageHandler(filters.TEXT & ~filters.COMMAND, arxiv_id_handler),
         ],
         states={
             IDLE: [
+                CommandHandler("new", new_session_handler),
+                CommandHandler("help", help_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, arxiv_id_handler),
                 CallbackQueryHandler(callback_handler),
             ],
             READY: [
                 CommandHandler("summarize", summarize_handler),
                 CommandHandler("new", new_session_handler),
+                CommandHandler("help", help_handler),
                 CallbackQueryHandler(callback_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, question_handler),
             ],
             SESSION_ENDED: [
                 CallbackQueryHandler(callback_handler),
                 CommandHandler("new", new_session_handler),
+                CommandHandler("help", help_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, arxiv_id_handler),
             ],
         },
         fallbacks=[
             CommandHandler("start", start_handler),
             CommandHandler("new", new_session_handler),
+            CommandHandler("help", help_handler),
         ],
     )
 

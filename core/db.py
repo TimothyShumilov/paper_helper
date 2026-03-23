@@ -16,15 +16,16 @@ SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     BIGINT NOT NULL,
-    arxiv_id    VARCHAR(32) NOT NULL,
-    paper_title TEXT,
-    status      VARCHAR(16) NOT NULL DEFAULT 'active',
-    rating      SMALLINT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    ended_at    TIMESTAMPTZ,
-    expires_at  TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       BIGINT NOT NULL,
+    arxiv_id      VARCHAR(32) NOT NULL,
+    paper_title   TEXT,
+    status        VARCHAR(16) NOT NULL DEFAULT 'active',
+    rating        SMALLINT,
+    trace_consent BOOLEAN,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at      TIMESTAMPTZ,
+    expires_at    TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours'),
     CONSTRAINT chk_status CHECK (status IN ('active', 'ended', 'expired')),
     CONSTRAINT chk_rating CHECK (rating IN (-1, 1))
 );
@@ -72,6 +73,10 @@ async def init_db() -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+        # Migration: add trace_consent column if it doesn't exist (for existing DBs)
+        await conn.execute(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS trace_consent BOOLEAN;"
+        )
     logger.info("Database schema initialized.")
 
 
@@ -136,6 +141,25 @@ async def get_session_by_id(session_id: uuid.UUID) -> Optional[dict]:
     return dict(row) if row else None
 
 
+async def get_session_by_arxiv_id(user_id: int, arxiv_id: str) -> Optional[dict]:
+    """Return the most recent non-expired session for this user and paper, or None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, arxiv_id, paper_title, status,
+                   rating, created_at, ended_at, expires_at
+            FROM sessions
+            WHERE user_id = $1 AND arxiv_id = $2 AND status != 'expired'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            user_id,
+            arxiv_id,
+        )
+    return dict(row) if row else None
+
+
 async def get_recent_sessions(user_id: int, hours: int = 24) -> list[dict]:
     """Return all sessions within the TTL window (regardless of status)."""
     pool = await get_pool()
@@ -178,9 +202,20 @@ async def rate_session(session_id: uuid.UUID, rating: int) -> None:
         )
 
 
-async def expire_old_sessions() -> list[str]:
+async def set_trace_consent(session_id: uuid.UUID, consent: bool) -> None:
+    """Store user consent to save conversation history for Langfuse tracing."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE sessions SET trace_consent=$1 WHERE id=$2",
+            consent,
+            session_id,
+        )
+
+
+async def expire_old_sessions() -> list[dict]:
     """
-    Mark expired sessions and return their IDs (for Qdrant cleanup).
+    Mark expired sessions and return their full rows (for Qdrant cleanup + Langfuse logging).
     Called by the hourly scheduler.
     """
     pool = await get_pool()
@@ -191,13 +226,13 @@ async def expire_old_sessions() -> list[str]:
             SET status = 'expired'
             WHERE expires_at < NOW()
               AND status = 'active'
-            RETURNING id::text
+            RETURNING id, user_id, rating, trace_consent, arxiv_id, paper_title
             """
         )
-    expired_ids = [r["id"] for r in rows]
-    if expired_ids:
-        logger.info("Expired %d sessions.", len(expired_ids))
-    return expired_ids
+    expired = [dict(r) for r in rows]
+    if expired:
+        logger.info("Expired %d sessions.", len(expired))
+    return expired
 
 
 # ---------------------------------------------------------------------------
