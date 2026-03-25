@@ -25,3 +25,6 @@ pydantic-settings==2.3.4
 
 # Scheduling
 APScheduler==3.10.4
+
+# Observability
+langfuse>=2.0,<3.0
